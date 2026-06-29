@@ -13,6 +13,7 @@ import sys
 import time
 import wave
 import shutil
+import struct
 import threading
 import random
 from pathlib import Path
@@ -265,17 +266,20 @@ def _populate_current_kit(src=None, generate_all=False):
 class Mixer:
     """Mixes active voices in a sounddevice output callback."""
 
-    def __init__(self, sr=SAMPLE_RATE, blocksize=512, record_path=None):
+    def __init__(self, sr=SAMPLE_RATE, blocksize=512, record_path=None, device=None):
         self._lock = threading.Lock()
         self._playing = {}  # channel_id -> [audio_f32, position]
         self._record_path = record_path
         self._recorded = [] if record_path else None
+        dev_info = sd.query_devices(device if device is not None else sd.default.device[1], "output")
+        n_ch = min(int(dev_info["max_output_channels"]), 2)
         self._stream = sd.OutputStream(
             samplerate=sr,
-            channels=1,
+            channels=n_ch,
             dtype="float32",
             blocksize=blocksize,
             callback=self._callback,
+            device=device,
         )
         self._sr = sr
         self._stream.start()
@@ -296,7 +300,7 @@ class Mixer:
             for ch_id in done:
                 del self._playing[ch_id]
         out = np.clip(buf, -1.0, 1.0)
-        outdata[:, 0] = out
+        outdata[:] = out[:, np.newaxis]  # broadcast mono mix to all channels
         if self._recorded is not None:
             self._recorded.append(out.copy())
 
@@ -321,13 +325,65 @@ class Mixer:
             print(f"Saved recording to {self._record_path}")
 
 
+# ── DMX ───────────────────────────────────────────────────────────────────────
+
+def _dmx_packet(channels: bytearray) -> bytes:
+    data = bytes([0x00]) + bytes(channels)
+    return b'\x7E\x06' + struct.pack('<H', len(data)) + data + b'\xE7'
+
+
+def find_enttec():
+    try:
+        from serial.tools.list_ports import comports
+    except ImportError:
+        return None
+    for p in comports():
+        if p.vid == 0x0403:
+            return p.device
+        if 'EN' in (p.serial_number or ''):
+            return p.device
+    return None
+
+
+class DMXFlasher:
+    def __init__(self, port, dmx_channel=1, fade_s=0.5):
+        import serial
+        self._ser = serial.Serial(port, 57600, timeout=1)
+        self._ch_idx = dmx_channel - 1
+        self._channels = bytearray(512)
+        self._brightness = 0.0
+        self._fade_step = 255.0 / (fade_s * 60)
+        self._lock = threading.Lock()
+        threading.Thread(target=self._fade_loop, daemon=True).start()
+
+    def flash(self, velocity):
+        with self._lock:
+            self._brightness = velocity / 127.0 * 255.0
+
+    def _fade_loop(self):
+        while True:
+            with self._lock:
+                if self._brightness > 0:
+                    self._brightness = max(0.0, self._brightness - self._fade_step)
+                    self._channels[self._ch_idx] = int(self._brightness)
+                    self._ser.write(_dmx_packet(self._channels))
+            time.sleep(1 / 60)
+
+    def close(self):
+        with self._lock:
+            self._channels[self._ch_idx] = 0
+        self._ser.write(_dmx_packet(self._channels))
+        self._ser.close()
+
+
 # ── MIDI player ───────────────────────────────────────────────────────────────
 
 class DrumPlayer:
-    def __init__(self, sounds, log_notes=False, record_path=None):
+    def __init__(self, sounds, log_notes=False, record_path=None, device=None, dmx_flasher=None):
         self.log_notes = log_notes
+        self.dmx_flasher = dmx_flasher
         self.sounds = {note: sounds[label] for note, label in NOTE_MAP.items()}
-        self.mixer = Mixer(record_path=record_path)
+        self.mixer = Mixer(record_path=record_path, device=device)
 
         self.midi_in = rtmidi.MidiIn()
         n_ports = self.midi_in.get_port_count()
@@ -373,6 +429,9 @@ class DrumPlayer:
 
         self.mixer.play(note, self.sounds[note], volume=velocity / 127.0)
 
+        if self.dmx_flasher:
+            self.dmx_flasher.flash(velocity)
+
     def run(self):
         print(f"Ready — {len(NOTE_MAP)} voices. Ctrl-C to quit.\n")
         try:
@@ -383,6 +442,8 @@ class DrumPlayer:
         finally:
             self.midi_in.close_port()
             self.mixer.close()
+            if self.dmx_flasher:
+                self.dmx_flasher.close()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -398,6 +459,16 @@ Sound source (pick one, default is current_kit/):
 Playback:
   --record [<file>]       Record the session to a WAV file. If no filename is
                           given, auto-increments: session_1.wav, session_2.wav…
+  --device <id|name>      Force a specific audio output device (use
+                          --list-devices to see options)
+  --list-devices          Print available audio output devices and exit
+
+DMX lighting (Enttec USB Pro Mk2):
+  --dmx                   Enable DMX; auto-detects Enttec device
+  --dmx-port <path>       Serial port for the Enttec (implies --dmx)
+  --dmx-channel <n>       DMX channel to control, 1-indexed (default 1)
+  --fade <seconds>        Fade-to-black duration in seconds (default 0.5)
+  --list-ports            Print available serial ports and exit
 
 Workflow:
   current_kit/            Always the active kit. Copy it elsewhere to save it.
@@ -424,6 +495,21 @@ if __name__ == "__main__":
         print(HELP)
         sys.exit(0)
 
+    if flag("--list-devices"):
+        print("Output devices:")
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_output_channels"] > 0:
+                marker = " *" if i == sd.default.device[1] else ""
+                print(f"  {i:2d}  {dev['name']}{marker}")
+        sys.exit(0)
+
+    if flag("--list-ports"):
+        from serial.tools.list_ports import comports
+        print("Serial ports:")
+        for p in comports():
+            print(f"  {p.device}  {p.description}  vid={p.vid:#06x}")
+        sys.exit(0)
+
     log_notes = flag("--log-notes")
 
     record_path = flag_val("--record")
@@ -445,4 +531,20 @@ if __name__ == "__main__":
     else:
         sounds = _populate_current_kit()
 
-    DrumPlayer(sounds, log_notes=log_notes, record_path=record_path).run()
+    device = flag_val("--device")
+    if device is not None and device.isdigit():
+        device = int(device)
+
+    dmx_flasher = None
+    if flag("--dmx") or flag_val("--dmx-port"):
+        dmx_port = flag_val("--dmx-port") or find_enttec()
+        if not dmx_port:
+            print("Error: Enttec USB Pro not found. Use --dmx-port <path>.", file=sys.stderr)
+            sys.exit(1)
+        dmx_ch = int(flag_val("--dmx-channel") or 1)
+        fade_s = float(flag_val("--fade") or 0.5)
+        dmx_flasher = DMXFlasher(dmx_port, dmx_channel=dmx_ch, fade_s=fade_s)
+        print(f"DMX: {dmx_port}  channel {dmx_ch}  fade {fade_s}s")
+
+    DrumPlayer(sounds, log_notes=log_notes, record_path=record_path,
+               device=device, dmx_flasher=dmx_flasher).run()
